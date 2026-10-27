@@ -159,8 +159,8 @@ Resources:
           TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
           REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
           {
-            echo "MONGODB_URI=$(aws ssm get-parameter --region $REGION --with-decryption --name ${MongoUriParam} --query Parameter.Value --output text)"
-            echo "JWT_SECRET=$(aws ssm get-parameter --region $REGION --with-decryption --name ${JwtSecretParam} --query Parameter.Value --output text)"
+            printf 'MONGODB_URI=%q\n' "$(aws ssm get-parameter --region $REGION --with-decryption --name ${MongoUriParam} --query Parameter.Value --output text)"
+            printf 'JWT_SECRET=%q\n' "$(aws ssm get-parameter --region $REGION --with-decryption --name ${JwtSecretParam} --query Parameter.Value --output text)"
             echo "PORT=3000"
           } > /run/pt.env
           chmod 600 /run/pt.env

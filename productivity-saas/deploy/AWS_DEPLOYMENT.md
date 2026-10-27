@@ -62,6 +62,7 @@ On every start of the pt-api service, a small script (/usr/local/bin/pt-env.sh) 
 - No default VPC: added our own VPC, subnet, gateway and routes to the template.
 - CloudFront was rejected with access denied (the new account is still under AWS verification), so the design was changed from S3 plus CloudFront to a single EC2 instance with nginx. The original CloudFront variant is kept in deploy/cloudformation.yaml for later.
 - CloudShell was unavailable for the same verification reason, so the stack was deployed through the console.
+- The database connection string was being dropped. The env file is read by the shell, and the `&` characters in an Atlas URI (and any spaces in secrets) were interpreted as shell syntax, so the API silently fell back to localhost MongoDB and every login timed out. The log showed `connect ECONNREFUSED 127.0.0.1:27017`. Fixed by writing the values with `printf %q`, which escapes them safely. Lesson: read the service log before blaming the database allowlist.
 - The API service first failed to start because systemd could not load the env file that is created at start time. It now runs through a bash wrapper that fetches and sources the secrets, and nginx is started first so a failure in one does not take down the other. The instance was replaced and /api/health now returns ok.
 
 ## 3b. Why each decision was made
