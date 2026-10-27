@@ -154,7 +154,18 @@ Checks after deploy:
 - http://3.7.158.104 shows the login page
 - Register and log in to confirm the database connection
 
-Open item at the time of writing: a test login still returned a MongoDB buffering timeout after the update, which means Atlas was not yet accepting connections from the server. Fix is on the Atlas side (allowlist entry active, cluster running, correct password in the stored connection string). The app connects on its own once that is correct.
+Verification run against the live server (27 Oct 2026):
+
+| Check | Result |
+|---|---|
+| Site over HTTP (http://3.7.158.104) | 200, login page renders |
+| GET /api/health | 200, status ok |
+| 8 protected endpoints without a token (tasks, habits, focus, distractions, notes, analytics, auth/me, task stats) | all return 401 |
+| Sign-up with an empty body | 400 with validation errors |
+| Login with wrong credentials | 401 "Invalid credentials" in about 25 ms, which shows the API reaches MongoDB |
+| CloudFormation stack | UPDATE_COMPLETE with the alarms, topic and dashboard |
+
+Logged-in features (tasks, habits, focus sessions, notes, calendar, analytics) are exercised through the UI with a real account during the demo.
 
 ## 7. Security notes
 
