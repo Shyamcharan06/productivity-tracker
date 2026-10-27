@@ -105,3 +105,31 @@ Open `http://localhost:5500` in your browser.
 ## Author
 
 **Shyamcharan Bharathi**
+
+---
+
+## AWS Deployment
+
+The app also runs fully on AWS (region ap-south-1), defined as code in `productivity-saas/deploy/`.
+
+```
+Browser -> Elastic IP :80 -> EC2 t3.micro (nginx -> Node/Express on :3000) -> MongoDB Atlas
+                                   |
+                         SSM Parameter Store (secrets) via IAM role
+```
+
+What was built and why:
+
+- **CloudFormation** (`deploy/cloudformation-ec2.yaml`): one template creates and updates everything, so the setup is repeatable and changes can be previewed.
+- **VPC, subnet, internet gateway, route table**: a dedicated network, since the account had no default VPC.
+- **EC2 t3.micro (Amazon Linux 2023)**: the API is a long-running Express server with a persistent database connection, which suits a server better than Lambda. cloud-init installs Node 20, nginx and the app on first boot.
+- **nginx**: serves the static client and proxies `/api` to Node on a private port, so the site and API share one origin (no CORS).
+- **Elastic IP**: a fixed address, needed because MongoDB Atlas only accepts allowlisted IPs.
+- **Security group**: only TCP 80 is open and there is no SSH; admin access is through Session Manager.
+- **SSM Parameter Store + IAM role**: the MongoDB URI and JWT secret are encrypted SecureStrings; the instance role can read only those two parameters, so no secrets live in the repo or on disk in plain text.
+- **IMDSv2 required** and **systemd** with `Restart=always` for hardening and self-restart.
+- **Monitoring**: CloudWatch alarms (auto-recover on host failure, reboot on OS failure, high CPU), an SNS email topic and a CloudWatch dashboard.
+
+Full explanation, design decisions, redeploy steps, security notes and future work: [`productivity-saas/deploy/AWS_DEPLOYMENT.md`](productivity-saas/deploy/AWS_DEPLOYMENT.md). A high level slide deck is in `productivity-saas/deploy/productivity-tracker-aws.pptx`.
+
+Files in `deploy/`: `cloudformation-ec2.yaml` (deployed stack), `cloudformation.yaml` (S3 + CloudFront variant for HTTPS once the account is verified), `deploy.sh` (CLI deploy for that variant).

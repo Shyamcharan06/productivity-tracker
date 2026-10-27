@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Productivity Tracker - S3 + CloudFront for the client, EC2 for the Node API, CloudFront routes /api/* to EC2
+
+Parameters:
+  RepoUrl:
+    Type: String
+    Default: https://github.com/Shyamcharan06/productivity-tracker
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  CloudFrontPrefixListId:
+    Type: String
+    Default: ''
+    Description: Optional. Managed prefix list com.amazonaws.global.cloudfront.origin-facing. If blank, port 80 is open to the internet.
+  MongoUriParam:
+    Type: String
+    Default: /productivity-tracker/MONGODB_URI
+  JwtSecretParam:
+    Type: String
+    Default: /productivity-tracker/JWT_SECRET
+
+Conditions:
+  HasPrefixList: !Not [!Equals [!Ref CloudFrontPrefixListId, '']]
+  IsUsEast1: !Equals [!Ref 'AWS::Region', 'us-east-1']
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  PublicSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  OAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${SiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  ApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from CloudFront only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !If [HasPrefixList, !Ref CloudFrontPrefixListId, !Ref 'AWS::NoValue']
+          CidrIp: !If [HasPrefixList, !Ref 'AWS::NoValue', '0.0.0.0/0']
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: read-app-params
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MongoUriParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${JwtSecretParam}'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  ApiInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!GetAtt ApiSecurityGroup.GroupId]
+      MetadataOptions:
+        HttpTokens: required
+      Tags:
+        - Key: Name
+          Value: productivity-tracker-api
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y nodejs20 nodejs20-npm git
+          git clone --depth 1 ${RepoUrl} /opt/app-src
+          cd /opt/app-src/productivity-saas/server
+          npm ci --omit=dev
+
+          cat > /usr/local/bin/pt-env.sh <<'EOF'
+          #!/bin/bash
+          TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+          REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+          {
+            echo "MONGODB_URI=$(aws ssm get-parameter --region $REGION --with-decryption --name ${MongoUriParam} --query Parameter.Value --output text)"
+            echo "JWT_SECRET=$(aws ssm get-parameter --region $REGION --with-decryption --name ${JwtSecretParam} --query Parameter.Value --output text)"
+            echo "PORT=80"
+          } > /run/pt.env
+          chmod 600 /run/pt.env
+          EOF
+          chmod +x /usr/local/bin/pt-env.sh
+
+          cat > /etc/systemd/system/pt-api.service <<'EOF'
+          [Unit]
+          Description=Productivity Tracker API
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          WorkingDirectory=/opt/app-src/productivity-saas/server
+          ExecStartPre=/usr/local/bin/pt-env.sh
+          EnvironmentFile=/run/pt.env
+          ExecStart=/usr/bin/node server.js
+          Restart=always
+          RestartSec=5
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now pt-api
+
+  ApiEip:
+    DependsOn: IgwAttach
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  ApiEipAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ApiEip.AllocationId
+      InstanceId: !Ref ApiInstance
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: ApiEipAssoc
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: api
+            DomainName: !If
+              - IsUsEast1
+              - !Join ['', ['ec2-', !Join ['-', !Split ['.', !Ref ApiEip]], '.compute-1.amazonaws.com']]
+              - !Join ['', ['ec2-', !Join ['-', !Split ['.', !Ref ApiEip]], '.', !Ref 'AWS::Region', '.compute.amazonaws.com']]
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # Managed-CachingOptimized
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad   # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-42cc-bdbf-9afe3f6b5ea2   # AllViewerExceptHostHeader
+
+Outputs:
+  SiteUrl:
+    Value: !Sub 'https://${Distribution.DomainName}'
+  BucketName:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref Distribution
+  ApiElasticIp:
+    Description: Whitelist this IP in MongoDB Atlas Network Access
+    Value: !Ref ApiEip
+  InstanceId:
+    Value: !Ref ApiInstance

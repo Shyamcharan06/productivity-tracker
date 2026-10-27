@@ -1,0 +1,292 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Productivity Tracker on a single EC2 instance - nginx serves the client and proxies /api to the Node server (no CloudFront)
+
+Parameters:
+  RepoUrl:
+    Type: String
+    Default: https://github.com/Shyamcharan06/productivity-tracker
+  ClientUrl:
+    Type: String
+    Default: https://raw.githubusercontent.com/Shyamcharan06/productivity-tracker/main/productivity-saas/client/index.html
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  MongoUriParam:
+    Type: String
+    Default: /productivity-tracker/MONGODB_URI
+  JwtSecretParam:
+    Type: String
+    Default: /productivity-tracker/JWT_SECRET
+  AlertEmail:
+    Type: String
+    Default: shyamcb11@gmail.com
+    Description: Email that receives CloudWatch alarm notifications (confirm the SNS subscription mail)
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  PublicSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: read-app-params
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MongoUriParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${JwtSecretParam}'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  WebInstanceV3:
+    Type: AWS::EC2::Instance
+    DependsOn: PublicRoute
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!GetAtt WebSecurityGroup.GroupId]
+      MetadataOptions:
+        HttpTokens: required
+      Tags:
+        - Key: Name
+          Value: productivity-tracker
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y nodejs20 nodejs20-npm git nginx
+          git clone --depth 1 ${RepoUrl} /opt/app-src
+          cd /opt/app-src/productivity-saas/server
+          npm ci --omit=dev
+
+          # client: same-origin API
+          curl -fsSL ${ClientUrl} | sed "s#const API_URL = '[^']*';#const API_URL = '/api';#" > /usr/share/nginx/html/index.html
+
+          cat > /etc/nginx/nginx.conf <<'EOF'
+          user nginx;
+          worker_processes auto;
+          pid /run/nginx.pid;
+          events { worker_connections 512; }
+          http {
+            include /etc/nginx/mime.types;
+            default_type application/octet-stream;
+            server {
+              listen 80 default_server;
+              server_name _;
+              root /usr/share/nginx/html;
+              index index.html;
+              location /api/ {
+                proxy_pass http://127.0.0.1:3000;
+                proxy_set_header Host $host;
+                proxy_set_header X-Forwarded-For $remote_addr;
+              }
+              location / {
+                try_files $uri /index.html;
+              }
+            }
+          }
+          EOF
+
+          cat > /usr/local/bin/pt-env.sh <<'EOF'
+          #!/bin/bash
+          TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+          REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+          {
+            echo "MONGODB_URI=$(aws ssm get-parameter --region $REGION --with-decryption --name ${MongoUriParam} --query Parameter.Value --output text)"
+            echo "JWT_SECRET=$(aws ssm get-parameter --region $REGION --with-decryption --name ${JwtSecretParam} --query Parameter.Value --output text)"
+            echo "PORT=3000"
+          } > /run/pt.env
+          chmod 600 /run/pt.env
+          EOF
+          chmod +x /usr/local/bin/pt-env.sh
+
+          cat > /etc/systemd/system/pt-api.service <<'EOF'
+          [Unit]
+          Description=Productivity Tracker API
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          WorkingDirectory=/opt/app-src/productivity-saas/server
+          ExecStart=/bin/bash -c '/usr/local/bin/pt-env.sh && set -a && . /run/pt.env && exec node server.js'
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now nginx
+          systemctl enable --now pt-api
+
+  WebEip:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttach
+    Properties:
+      Domain: vpc
+
+  WebEipAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt WebEip.AllocationId
+      InstanceId: !Ref WebInstanceV3
+
+  # ---- monitoring and self-healing (added on top of the base deployment) ----
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: productivity-tracker-alerts
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  SystemStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Underlying AWS host failed - auto recover the instance
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_System
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WebInstanceV3
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Sub 'arn:aws:automate:${AWS::Region}:ec2:recover'
+        - !Ref AlertTopic
+
+  InstanceStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: OS level check failed - reboot the instance
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_Instance
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WebInstanceV3
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Sub 'arn:aws:automate:${AWS::Region}:ec2:reboot'
+        - !Ref AlertTopic
+
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: CPU above 80 percent for 10 minutes (t3.micro burst credits may be running out)
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WebInstanceV3
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: productivity-tracker
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"CPU utilization","region":"${AWS::Region}","stat":"Average","period":300,"metrics":[["AWS/EC2","CPUUtilization","InstanceId","${WebInstanceV3}"]]}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Network in and out","region":"${AWS::Region}","stat":"Sum","period":300,"metrics":[["AWS/EC2","NetworkIn","InstanceId","${WebInstanceV3}"],["AWS/EC2","NetworkOut","InstanceId","${WebInstanceV3}"]]}},
+          {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Status checks","region":"${AWS::Region}","stat":"Maximum","period":60,"metrics":[["AWS/EC2","StatusCheckFailed_System","InstanceId","${WebInstanceV3}"],["AWS/EC2","StatusCheckFailed_Instance","InstanceId","${WebInstanceV3}"]]}}
+        ]}
+
+Outputs:
+  SiteUrl:
+    Value: !Sub 'http://${WebEip}'
+  ApiElasticIp:
+    Description: Whitelist this IP in MongoDB Atlas Network Access
+    Value: !Ref WebEip
+  InstanceId:
+    Value: !Ref WebInstanceV3
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  DashboardName:
+    Value: !Ref Dashboard
